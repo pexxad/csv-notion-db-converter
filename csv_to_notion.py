@@ -90,18 +90,67 @@ def extract_notion_composite_key(page: Dict[str, Any], mapping: Dict[str, Any], 
     return "::".join(values)
 
 
-def filter_new_rows(csv_rows, notion_pages, mapping, composite_keys):
-    notion_keys = set([extract_notion_composite_key(page, mapping, composite_keys) for page in notion_pages])
+def are_properties_equal(csv_row: Dict[str, Any], notion_page: Dict[str, Any], mapping: Dict[str, Any]) -> bool:
+    """Compares properties of a CSV row and a Notion page based on the mapping."""
+    notion_props = notion_page["properties"]
+    for csv_col, mapinfo in mapping.items():
+        notion_prop_name = mapinfo["notion"]
+        prop_type = mapinfo["type"]
+        csv_value = csv_row[csv_col]
+
+        # Skip comparison for properties that are automatically managed by Notion
+        if prop_type in ["last_edited_by", "last_edited_time"]:
+            continue
+
+        # Get the current value from the Notion page
+        notion_value = None
+        if notion_prop_name in notion_props:
+            notion_prop = notion_props[notion_prop_name]
+            if prop_type == "title":
+                notion_value = notion_prop["title"][0]["plain_text"] if notion_prop["title"] else ""
+            elif prop_type == "text":
+                notion_value = notion_prop["rich_text"][0]["plain_text"] if notion_prop["rich_text"] else ""
+            elif prop_type == "select":
+                notion_value = notion_prop["select"]["name"] if notion_prop["select"] else ""
+            elif prop_type == "multi_select":
+                notion_value = (
+                    ",".join([v["name"] for v in notion_prop["multi_select"]])
+                    if notion_prop["multi_select"]
+                    else ""
+                )
+            elif prop_type == "relation":
+                notion_value = (
+                    ",".join([v["id"] for v in notion_prop["relation"]]) if notion_prop["relation"] else ""
+                )
+            elif prop_type == "people":
+                notion_value = ",".join([v["id"] for v in notion_prop["people"]]) if notion_prop["people"] else ""
+            # Add other types as needed
+
+        # Compare values
+        if str(csv_value) != str(notion_value):
+            return False
+
+    return True
+
+
+def filter_rows(csv_rows, notion_pages, mapping, composite_keys):
+    notion_pages_by_key = {
+        extract_notion_composite_key(page, mapping, composite_keys): page for page in notion_pages
+    }
     new_rows = []
     update_rows = []
+    skip_rows = []
     for row in csv_rows:
         row_key = extract_composite_key(row, composite_keys)
-        if row_key not in notion_keys:
+        if row_key not in notion_pages_by_key:
             new_rows.append(row)
         else:
-            print(f"[SKIP] Already exists: {row_key}")
-            update_rows.append(row)
-    return new_rows, update_rows
+            notion_page = notion_pages_by_key[row_key]
+            if are_properties_equal(row, notion_page, mapping):
+                skip_rows.append(row)
+            else:
+                update_rows.append(row)
+    return new_rows, update_rows, skip_rows
 
 
 def make_notion_payload(row: Dict[str, Any], mapping: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,12 +266,17 @@ def main():
 
     csv_rows = load_csv(args.csv, config.COMPOSITE_KEY)
     notion_pages = get_notion_db_items(config.CSV_TO_NOTION_MAPPING, config.COMPOSITE_KEY)
-    new_rows, update_rows = filter_new_rows(csv_rows, notion_pages, config.CSV_TO_NOTION_MAPPING, config.COMPOSITE_KEY)
+    new_rows, update_rows, skip_rows = filter_rows(csv_rows, notion_pages, config.CSV_TO_NOTION_MAPPING, config.COMPOSITE_KEY)
+
     if not args.dryrun:
         register_to_notion(new_rows, config.CSV_TO_NOTION_MAPPING)
         update_notion(update_rows, notion_pages, config.CSV_TO_NOTION_MAPPING, config.COMPOSITE_KEY)
     else:
-        print("ドライランモードのため、Notion APIへの登録はスキップします")
+        print("ドライランモードのため、Notion APIへの登録・更新はスキップします")
+
+    for row in skip_rows:
+        print(f"[SKIP] Properties match: {extract_composite_key(row, config.COMPOSITE_KEY)}")
+
     print("完了")
 
 
